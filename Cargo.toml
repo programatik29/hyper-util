@@ -59,7 +59,7 @@ full = [
 client = ["hyper/client", "dep:tracing", "dep:futures-channel", "dep:tower", "dep:tower-service"]
 client-legacy = ["client"]
 
-server = ["hyper/server"]
+server = ["hyper/server", "dep:tower-service"]
 server-auto = ["server", "http1", "http2"]
 
 service = ["dep:tower", "dep:tower-service"]
