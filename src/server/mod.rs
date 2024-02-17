@@ -1,7 +1,11 @@
 //! Server utilities.
 
 use self::conn::auto::{Builder, HttpServerConnExec};
-use crate::service::{TowerToHyperService, TowerToHyperServiceFuture};
+use crate::{
+    rt::TokioIo,
+    service::{TowerToHyperService, TowerToHyperServiceFuture},
+};
+use futures_util::TryFutureExt;
 use http::{Request, Response};
 use http_body::Body;
 use hyper::{
@@ -42,13 +46,13 @@ pub trait Listener {
 
 #[cfg(feature = "tokio")]
 impl Listener for TcpListener {
-    type Conn = TcpStream;
+    type Conn = TokioIo<TcpStream>;
     type Data = SocketAddr;
     type Error = std::io::Error;
     type Future<'a> = BoxFuture<'a, std::io::Result<(Self::Conn, Self::Data)>>;
 
     fn accept(&self) -> Self::Future<'_> {
-        Box::pin(self.accept())
+        Box::pin(self.accept().map_ok(|(c, d)| (TokioIo::new(c), d)))
     }
 }
 
@@ -73,7 +77,7 @@ pub trait Modify<I, S> {
 }
 
 /// Default modifier for server.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct NoModify {}
 
 impl NoModify {
@@ -124,10 +128,10 @@ impl<L, E, M> Server<L, E, M> {
     pub async fn serve<MS, S, B>(&self, mut make_service: MS) -> std::io::Result<()>
     where
         L: Listener,
-        L::Conn: Read + Write + Unpin + Send + 'static,
+        L::Conn: Send + 'static,
         L::Error: Into<Box<dyn StdError + Send + Sync>>,
         MS: tower_service::Service<L::Data, Response = S>,
-        MS::Error: Into<Box<dyn StdError + Send + Sync>> + Clone,
+        MS::Error: Into<Box<dyn StdError + Send + Sync>>,
         S: Send + 'static,
         M: Modify<L::Conn, S> + Clone + Send + 'static,
         M::Conn: Read + Write + Unpin + Send + 'static,
@@ -188,4 +192,68 @@ impl Server<TcpListener, TokioExecutor, NoModify> {
 
 fn io_other(e: impl Into<Box<dyn StdError + Send + Sync>>) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::Other, e)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Server;
+    use crate::rt::{TokioExecutor, TokioIo};
+    use bytes::Bytes;
+    use http::{Request, Response, StatusCode};
+    use http_body::Body;
+    use http_body_util::Empty;
+    use hyper::{body::Incoming, client::conn::http1 as client_http1};
+    use std::{convert::Infallible, error::Error as StdError, net::SocketAddr};
+    use tokio::net::{TcpListener, TcpStream};
+    use tower::{make::Shared, service_fn};
+
+    #[cfg(not(miri))]
+    #[tokio::test]
+    #[allow(unused_must_use)]
+    async fn request() {
+        let addr = start_server().await;
+        let mut client = connect::<Empty<Bytes>>(addr).await;
+
+        client.ready().await.unwrap();
+        let response = client
+            .send_request(Request::new(Empty::new()))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK)
+    }
+
+    async fn connect<B>(addr: SocketAddr) -> client_http1::SendRequest<B>
+    where
+        B: Body + Send + 'static,
+        B::Data: Send,
+        B::Error: Into<Box<dyn StdError + Send + Sync>>,
+    {
+        let io = TokioIo::new(TcpStream::connect(addr).await.unwrap());
+        let (send_request, connection) = client_http1::handshake(io).await.unwrap();
+
+        tokio::spawn(connection);
+
+        send_request
+    }
+
+    async fn start_server() -> SocketAddr {
+        let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            Server::new(listener, TokioExecutor::new())
+                .serve(Shared::new(service_fn(
+                    |_request: Request<Incoming>| async {
+                        Ok::<_, Infallible>(Response::new(Empty::<Bytes>::new()))
+                    },
+                )))
+                .await
+                .unwrap();
+        });
+
+        addr
+    }
 }
