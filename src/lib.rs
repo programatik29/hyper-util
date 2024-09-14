@@ -20,3 +20,7 @@ pub mod server;
 pub mod service;
 
 mod error;
+
+mod sealed {
+    pub trait Sealed<T> {}
+}
